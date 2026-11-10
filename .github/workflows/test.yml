@@ -1,22 +1,21 @@
 name: test
 
 on:
-  push:
-    branches:
-      - main
-      - "[0-9]+.[0-9]+.x"
-      - "test-me-*"
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+"
-      - "[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
-
-  pull_request:
-    branches:
-      - main
-      - "[0-9]+.[0-9]+.x"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector; empty runs the full suite"
+        required: false
+        default: ""
 
 env:
-  PYTEST_ADDOPTS: "--color=yes"
+  # sealed-libraries: "-rfEXs" keeps the project's addopts "-rfEX" report and adds skip reasons
+  PYTEST_ADDOPTS: "--color=yes -rfEXs"
+  # sealed-libraries: resolve build and test dependencies as of the 7.4.4 release date
+  PIP_INDEX_URL: "https://:2023-12-31T12:00:13Z@time-machines-pypi.sealsecurity.io/"
+  # sealed-libraries: the fork's commit is untagged and setuptools-scm 8.0.4 cannot parse the
+  # runner git's "Z"-suffixed %cI date on Python < 3.11 (editable `-e .` installs in xdist envs).
+  SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYTEST: "7.4.4"
 
 # Cancel running jobs for the same workflow and branch.
 concurrency:
@@ -29,13 +28,32 @@ permissions: {}
 jobs:
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SETUPTOOLS_SCM_PRETEND_VERSION: "7.4.4"
     steps:
     - uses: actions/checkout@v3
       with:
         fetch-depth: 0
         persist-credentials: false
+    # sealed-libraries: hynek/build-and-inspect-python-package@v1.5.3 uploads with the
+    # retired actions/upload-artifact@v3; its build step is inlined here unchanged.
+    - uses: actions/setup-python@v4
+      with:
+        python-version: "3.12"
     - name: Build and Check Package
-      uses: hynek/build-and-inspect-python-package@v1.5.3
+      shell: bash
+      run: |
+        python -Im venv /tmp/baipp
+        /tmp/baipp/bin/python -Im pip install build==1.0.3 wheel==0.42.0
+        SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct) /tmp/baipp/bin/python -m build --outdir /tmp/baipp/dist
+        ls -l /tmp/baipp/dist
+    - name: Upload built artifacts.
+      uses: actions/upload-artifact@v4
+      with:
+        name: Packages
+        path: /tmp/baipp/dist/*
+        if-no-files-found: error
 
   build:
     needs: [package]
@@ -109,24 +127,24 @@ jobs:
 
           - name: "ubuntu-py37"
             python: "3.7"
-            os: ubuntu-latest
+            os: ubuntu-22.04
             tox_env: "py37-lsof-numpy-pexpect"
             use_coverage: true
           - name: "ubuntu-py37-freeze"
             python: "3.7"
-            os: ubuntu-latest
+            os: ubuntu-22.04
             tox_env: "py37-freeze"
           - name: "ubuntu-py38"
             python: "3.8"
-            os: ubuntu-latest
+            os: ubuntu-22.04
             tox_env: "py38-xdist"
           - name: "ubuntu-py38-pluggy"
             python: "3.8"
-            os: ubuntu-latest
+            os: ubuntu-22.04
             tox_env: "py38-pluggymain-pylib-xdist"
           - name: "ubuntu-py39"
             python: "3.9"
-            os: ubuntu-latest
+            os: ubuntu-24.04
             tox_env: "py39-xdist"
           - name: "ubuntu-py310"
             python: "3.10"
@@ -150,6 +168,7 @@ jobs:
           - name: "macos-py37"
             python: "3.7"
             os: macos-latest
+            arch: x64
             tox_env: "py37-xdist"
           - name: "macos-py39"
             python: "3.9"
@@ -167,12 +186,12 @@ jobs:
 
           - name: "plugins"
             python: "3.9"
-            os: ubuntu-latest
+            os: ubuntu-24.04
             tox_env: "plugins"
 
           - name: "doctesting"
             python: "3.7"
-            os: ubuntu-latest
+            os: ubuntu-22.04
             tox_env: "doctesting"
             use_coverage: true
 
@@ -183,41 +202,139 @@ jobs:
         persist-credentials: false
 
     - name: Download Package
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         name: Packages
         path: dist
 
     - name: Set up Python ${{ matrix.python }}
+      if: runner.os != 'macOS'
       uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python }}
         check-latest: ${{ endsWith(matrix.python, '-dev') }}
+
+    # sealed-libraries: macos-latest is arm64; actions/setup-python cannot provision 3.9/3.10 there.
+    # CPython 3.7 has no arm64 build (and no openssl@1.1 to build one), so py37 runs x64 under Rosetta.
+    - name: Set up Python ${{ matrix.python }} (macOS)
+      if: runner.os == 'macOS' && matrix.arch != 'x64'
+      uses: MatteoH2O1999/setup-python@v4
+      with:
+        python-version: ${{ matrix.python }}
+        check-latest: ${{ endsWith(matrix.python, '-dev') }}
+        cache-build: true
+        allow-build: allow
+
+    # sealed-libraries: the hostedtoolcache x64 3.7.17 links Homebrew's x64 gettext, absent on arm64
+    # runners; the self-contained python.org Intel installer runs under Rosetta instead.
+    - name: Set up Python ${{ matrix.python }} (macOS x64)
+      if: runner.os == 'macOS' && matrix.arch == 'x64'
+      shell: bash
+      run: |
+        curl -sSfLO https://www.python.org/ftp/python/3.7.9/python-3.7.9-macosx10.9.pkg
+        sudo installer -pkg python-3.7.9-macosx10.9.pkg -target /
+        rm python-3.7.9-macosx10.9.pkg
+        PYBIN=/Library/Frameworks/Python.framework/Versions/3.7/bin
+        ln -sf "$PYBIN/python3.7" "$PYBIN/python"
+        ln -sf "$PYBIN/pip3.7" "$PYBIN/pip"
+        echo "$PYBIN" >> "$GITHUB_PATH"
+        "$PYBIN/python3.7" -c "import sys, ssl, platform; print(sys.version, ssl.OPENSSL_VERSION, platform.machine())"
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install tox coverage
 
+    # sealed-libraries: upstream spreads the optional test dependencies over single legs, so most
+    # legs skip the numpy/pexpect/twisted/asynctest/decorator/jinja2/xdist/exceptiongroup tests.
+    # Install all of them into every suite env (tox --override commands_pre) so each leg runs those tests too.
+    - name: Optional test dependencies
+      shell: bash
+      run: |
+        cat > .seal-extra-test-deps.txt <<'REQ'
+        decorator
+        jinja2
+        numpy
+        twisted
+        asynctest; python_version < "3.11"
+        exceptiongroup>=1.0.0rc8
+        pytest-xdist>=2.1.0
+        argcomplete @ https://files.pythonhosted.org/packages/74/f5/9373290775639cb67a2fce7f629a1c240dce9f12fe927bc32b2736e16dfc/argcomplete-3.6.3-py3-none-any.whl ; python_version >= "3.12"
+        REQ
+        # argcomplete 3.2.1 (release-date resolution) predates the _parse_known_args(..., intermixed)
+        # argparse of CPython >= 3.12.8 and crashes ('_action_conflicts'), which turns
+        # test_parseopt::test_argcomplete into a skip; 3.6.3 matches the new signature.
+        # xdist envs get pexpect only in a separate non-xdist `-m uses_pexpect` pass (as upstream's
+        # py37-pexpect leg). Six pdb tests there are xfail(#10042) and only fail under coverage, so that
+        # pass sets xfail_strict=false: they run and report XPASS instead of failing as strict XPASS.
+        # On Windows/PyPy pexpect installs everywhere: pytester.spawn then skips with "pexpect.spawn not
+        # available" / "pypy-64 bit not supported" before running anything.
+        case "${{ runner.os }}:${{ matrix.tox_env }}" in
+          Windows:*|*:pypy*) echo 'pexpect>=4.8.0' >> .seal-extra-test-deps.txt ;;
+          *:*xdist*) ;;
+          *) echo 'pexpect>=4.8.0' >> .seal-extra-test-deps.txt ;;
+        esac
+        cat .seal-extra-test-deps.txt
+        if [ "${{ matrix.tox_env }}" = "plugins" ] || [ "${{ matrix.tox_env }}" = "py37-freeze" ]; then
+          echo "SEAL_EXTRA_TEST_DEPS=0" >> "$GITHUB_ENV"
+        else
+          echo "SEAL_EXTRA_TEST_DEPS=1" >> "$GITHUB_ENV"
+        fi
+        case "${{ runner.os }}:${{ matrix.tox_env }}" in
+          Windows:*|*:pypy*) echo "SEAL_PEXPECT_PASS=0" >> "$GITHUB_ENV" ;;
+          *:*xdist*) echo "SEAL_PEXPECT_PASS=1" >> "$GITHUB_ENV" ;;
+          *) echo "SEAL_PEXPECT_PASS=0" >> "$GITHUB_ENV" ;;
+        esac
+
     - name: Test without coverage
       if: "! matrix.use_coverage"
       shell: bash
-      run: tox run -e ${{ matrix.tox_env }} --installpkg `find dist/*.tar.gz`
+      run: |
+        SEAL_OV=()
+        if [ "$SEAL_EXTRA_TEST_DEPS" = 1 ]; then
+          SEAL_OV=(-x "testenv.commands_pre=python -m pip install --index-url $PIP_INDEX_URL -r .seal-extra-test-deps.txt")
+        fi
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          tox run -e ${{ matrix.tox_env }} "${SEAL_OV[@]}" --installpkg `find dist/*.tar.gz` -- ${{ inputs.test-filter }} 2>&1 | tee -a seal-test-output.log
+        else
+          tox run -e ${{ matrix.tox_env }} "${SEAL_OV[@]}" --installpkg `find dist/*.tar.gz` 2>&1 | tee -a seal-test-output.log
+        fi
 
     - name: Test with coverage
       if: "matrix.use_coverage"
       shell: bash
-      run: tox run -e ${{ matrix.tox_env }}-coverage --installpkg `find dist/*.tar.gz`
+      run: |
+        SEAL_OV=()
+        if [ "$SEAL_EXTRA_TEST_DEPS" = 1 ]; then
+          SEAL_OV=(-x "testenv.commands_pre=python -m pip install --index-url $PIP_INDEX_URL -r .seal-extra-test-deps.txt")
+        fi
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          tox run -e ${{ matrix.tox_env }}-coverage "${SEAL_OV[@]}" --installpkg `find dist/*.tar.gz` -- ${{ inputs.test-filter }} 2>&1 | tee -a seal-test-output.log
+        else
+          tox run -e ${{ matrix.tox_env }}-coverage "${SEAL_OV[@]}" --installpkg `find dist/*.tar.gz` 2>&1 | tee -a seal-test-output.log
+        fi
+
+    - name: Test pexpect tests without xdist
+      if: env.SEAL_PEXPECT_PASS == '1' && inputs.test-filter == ''
+      shell: bash
+      run: |
+        tox run -e ${{ matrix.tox_env }}${{ matrix.use_coverage && '-coverage' || '' }} -x "testenv.commands_pre=python -m pip install --index-url $PIP_INDEX_URL pexpect>=4.8.0" --installpkg `find dist/*.tar.gz` -- -m uses_pexpect -p no:xdist -o xfail_strict=false 2>&1 | tee -a seal-test-output.log
+
+    - name: Skip notes
+      shell: bash
+      run: |
+        echo "== every skipped test of this leg, with its reason, and the pytest summary lines =="
+        sed 's/\x1b\[[0-9;]*m//g' seal-test-output.log | sed -nE '/^SKIPPED|^(XFAIL|XPASS) |^=+ .*(passed|failed|skipped)/p'
+        echo "sealed-libraries skip notes: every optional test dependency (numpy, pexpect, twisted, asynctest<3.11,"
+        echo "decorator, jinja2, exceptiongroup, pytest-xdist) is installed. Remaining skips are platform or interpreter gates:"
+        echo "- win32/darwin/linux-only and Python-version-gated tests (skip reason names the condition);"
+        echo "- nose tests on 3.12: nose imports the 'imp' module removed in Python 3.12;"
+        echo "- Windows: pexpect.spawn does not exist on Windows; lsof is a Unix-only tool (test_capture lsof_check);"
+        echo "  test_parseopt::test_argcomplete finds only the WSL bash stub (argcomplete is unsupported on win32);"
+        echo "  chmod cannot make a directory unwritable (test_cacheprovider) and the C locale tests need a POSIX locale;"
+        echo "- pypy 64-bit: pytester.spawn skips pexpect tests ('pypy-64 bit not supported');"
+        echo "- test_faulthandler.py:71 and test_warnings 'not relevant until pytest 8.0' are upstream-declared skips."
 
     - name: Generate coverage report
       if: "matrix.use_coverage"
       run: python -m coverage xml
-
-    - name: Upload coverage to Codecov
-      if: "matrix.use_coverage"
-      uses: codecov/codecov-action@v3
-      continue-on-error: true
-      with:
-        fail_ci_if_error: true
-        files: ./coverage.xml
-        verbose: true
